@@ -2162,10 +2162,12 @@ class BinaryNinjaBridge:
 
         if preview:
             before = self._decompile_text(bv, func)
+            snapshot = func.get_all_user_var_values()
             func.set_user_var_value(var, addr, pv)
             bv.update_analysis_and_wait()
             after = self._decompile_text(bv, func)
-            func.clear_user_var_value(var, addr)
+            self._restore_uidf_values(func, snapshot)
+            bv.update_analysis_and_wait()
             return {
                 "preview": True,
                 "set": True,
