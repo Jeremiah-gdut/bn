@@ -42,7 +42,7 @@ class BridgeInstance:
 
 
 def _is_tcp_instance(instance: BridgeInstance) -> bool:
-    return _is_tcp_instance(instance)
+    return IS_WINDOWS and instance.host is not None and instance.port is not None
 
 
 def _purge_stale_registry(registry_path: Path) -> None:
