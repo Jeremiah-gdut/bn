@@ -2,12 +2,24 @@ from __future__ import annotations
 
 import os
 import platform
+import socket
 import tempfile
 from pathlib import Path
 
 
 PLUGIN_NAME = "bn_agent_bridge"
 SKILL_NAME = "bn"
+
+IS_WINDOWS = platform.system() == "Windows"
+
+if IS_WINDOWS:
+    import random
+
+    def _pick_port() -> int:
+        """Pick a random port in the IANA dynamic range."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
 
 
 def repo_root() -> Path:
@@ -53,6 +65,27 @@ def bridge_registry_path() -> Path:
 
 def bridge_socket_path() -> Path:
     return cache_home() / f"{PLUGIN_NAME}.sock"
+
+
+BRIDGE_HOST = "127.0.0.1"
+
+
+def bridge_port_file() -> Path:
+    return cache_home() / f"{PLUGIN_NAME}.port"
+
+
+def bridge_listen_address() -> tuple[str, int]:
+    """Return (host, port) for the bridge server to listen on."""
+    return (BRIDGE_HOST, 0)
+
+
+def bridge_connect_address() -> tuple[str, int]:
+    """Return (host, port) to connect to the bridge, reading port from file."""
+    pf = bridge_port_file()
+    if not pf.exists():
+        raise FileNotFoundError(f"Bridge port file not found: {pf}")
+    port = int(pf.read_text(encoding="utf-8").strip())
+    return (BRIDGE_HOST, port)
 
 
 def api_docs_index_path() -> Path:

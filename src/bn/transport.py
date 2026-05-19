@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .paths import bridge_registry_path
+from .paths import bridge_registry_path, IS_WINDOWS
 
 
 class BridgeError(RuntimeError):
@@ -37,6 +37,8 @@ class BridgeInstance:
     plugin_version: str
     started_at: str | None
     meta: dict[str, Any]
+    host: str | None = None
+    port: int | None = None
 
 
 def _purge_stale_registry(registry_path: Path) -> None:
@@ -44,14 +46,61 @@ def _purge_stale_registry(registry_path: Path) -> None:
         registry_path.unlink()
 
 
-def _socket_probe_error(socket_path: Path, timeout: float = 0.2) -> OSError | None:
+def _socket_probe_error(
+    instance: BridgeInstance, timeout: float = 0.2
+) -> OSError | None:
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            sock.connect(str(socket_path))
+        if IS_WINDOWS and instance.host is not None and instance.port is not None:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                sock.connect((instance.host, instance.port))
+        else:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                sock.connect(str(instance.socket_path))
         return None
     except OSError as exc:
         return exc
+
+
+def _connect_and_send_unix(
+    instance: BridgeInstance,
+    encoded: bytes,
+    chunks: list[bytes],
+    timeout: float | None,
+) -> None:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        if timeout is not None:
+            sock.settimeout(timeout)
+        sock.connect(str(instance.socket_path))
+        sock.sendall(encoded)
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_WR)
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+
+
+def _connect_and_send_tcp(
+    instance: BridgeInstance,
+    encoded: bytes,
+    chunks: list[bytes],
+    timeout: float | None,
+) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        if timeout is not None:
+            sock.settimeout(timeout)
+        sock.connect((instance.host, instance.port))
+        sock.sendall(encoded)
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_WR)
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
 
 
 def _load_instance(path: Path) -> BridgeInstance | None:
@@ -62,11 +111,29 @@ def _load_instance(path: Path) -> BridgeInstance | None:
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
         return None
 
-    if not socket_path.exists():
+    host = payload.get("host")
+    port = payload.get("port")
+
+    if IS_WINDOWS and host is not None and port is not None:
+        # On Windows, probe the TCP port instead of checking file existence
+        pass
+    elif not socket_path.exists():
         _purge_stale_registry(path)
         return None
 
-    probe_error = _socket_probe_error(socket_path)
+    probe_error = _socket_probe_error(
+        BridgeInstance(
+            pid=pid,
+            socket_path=socket_path,
+            registry_path=path,
+            host=host,
+            port=port,
+            plugin_name="",
+            plugin_version="",
+            started_at=None,
+            meta=payload,
+        )
+    )
     if probe_error is not None and probe_error.errno in DENIED_SOCKET_ERRNOS:
         payload["socket_probe_error"] = str(probe_error)
     elif probe_error is not None:
@@ -77,6 +144,8 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         pid=pid,
         socket_path=socket_path,
         registry_path=path,
+        host=host,
+        port=port,
         plugin_name=str(payload.get("plugin_name", "bn_agent_bridge")),
         plugin_version=str(payload.get("plugin_version", "0")),
         started_at=payload.get("started_at"),
@@ -126,18 +195,10 @@ def _send_request_to_instance(
     last_error: OSError | None = None
     for attempt in range(connect_retries):
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                if timeout is not None:
-                    sock.settimeout(timeout)
-                sock.connect(str(instance.socket_path))
-                sock.sendall(encoded)
-                with contextlib.suppress(OSError):
-                    sock.shutdown(socket.SHUT_WR)
-                while True:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
+            if IS_WINDOWS and instance.host is not None and instance.port is not None:
+                _connect_and_send_tcp(instance, encoded, chunks, timeout)
+            else:
+                _connect_and_send_unix(instance, encoded, chunks, timeout)
             break
         except OSError as exc:
             last_error = exc
