@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import platform
-import socket
 import tempfile
 from pathlib import Path
 
@@ -11,15 +10,6 @@ PLUGIN_NAME = "bn_agent_bridge"
 SKILL_NAME = "bn"
 
 IS_WINDOWS = platform.system() == "Windows"
-
-if IS_WINDOWS:
-    import random
-
-    def _pick_port() -> int:
-        """Pick a random port in the IANA dynamic range."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
 
 
 def repo_root() -> Path:
@@ -45,11 +35,10 @@ def cache_home() -> Path:
     if env:
         return Path(env).expanduser()
 
-    system = platform.system()
     home = Path.home()
-    if system == "Darwin":
+    if platform.system() == "Darwin":
         return home / "Library" / "Caches" / "bn"
-    if system == "Windows":
+    if IS_WINDOWS:
         base = os.environ.get("LOCALAPPDATA")
         if base:
             return Path(base) / "bn"
@@ -80,11 +69,11 @@ def bridge_listen_address() -> tuple[str, int]:
 
 
 def bridge_connect_address() -> tuple[str, int]:
-    """Return (host, port) to connect to the bridge, reading port from file."""
     pf = bridge_port_file()
-    if not pf.exists():
-        raise FileNotFoundError(f"Bridge port file not found: {pf}")
-    port = int(pf.read_text(encoding="utf-8").strip())
+    try:
+        port = int(pf.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError) as exc:
+        raise FileNotFoundError(f"Bridge port file not found or invalid: {pf}") from exc
     return (BRIDGE_HOST, port)
 
 
@@ -107,14 +96,13 @@ def binary_ninja_plugin_dir() -> Path:
     if env:
         return Path(env).expanduser()
 
-    system = platform.system()
     home = Path.home()
-    if system == "Darwin":
-        return home / "Library" / "Application Support" / "Binary Ninja" / "plugins"
-    if system == "Windows":
+    if IS_WINDOWS:
         appdata = os.environ.get("APPDATA")
         if appdata:
             return Path(appdata) / "Binary Ninja" / "plugins"
+    if platform.system() == "Darwin":
+        return home / "Library" / "Application Support" / "Binary Ninja" / "plugins"
     return home / ".binaryninja" / "plugins"
 
 

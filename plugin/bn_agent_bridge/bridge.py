@@ -562,8 +562,10 @@ else:
             self.bridge = bridge
             super().__init__(socket_path, handler)
 
+    def _BridgeServerAddress():
+        return (bridge_socket_path(),)
+
     _BridgeServer = ThreadedUnixServer
-    _BridgeServerAddress = lambda: (bridge_socket_path(),)
 
 
 class BinaryNinjaBridge:

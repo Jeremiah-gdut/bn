@@ -41,6 +41,10 @@ class BridgeInstance:
     port: int | None = None
 
 
+def _is_tcp_instance(instance: BridgeInstance) -> bool:
+    return _is_tcp_instance(instance)
+
+
 def _purge_stale_registry(registry_path: Path) -> None:
     with contextlib.suppress(OSError):
         registry_path.unlink()
@@ -50,7 +54,7 @@ def _socket_probe_error(
     instance: BridgeInstance, timeout: float = 0.2
 ) -> OSError | None:
     try:
-        if IS_WINDOWS and instance.host is not None and instance.port is not None:
+        if _is_tcp_instance(instance):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(timeout)
                 sock.connect((instance.host, instance.port))
@@ -63,36 +67,20 @@ def _socket_probe_error(
         return exc
 
 
-def _connect_and_send_unix(
+def _connect_and_send(
     instance: BridgeInstance,
     encoded: bytes,
     chunks: list[bytes],
     timeout: float | None,
 ) -> None:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+    if _is_tcp_instance(instance):
+        family, connect_addr = socket.AF_INET, (instance.host, instance.port)
+    else:
+        family, connect_addr = socket.AF_UNIX, str(instance.socket_path)
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
         if timeout is not None:
             sock.settimeout(timeout)
-        sock.connect(str(instance.socket_path))
-        sock.sendall(encoded)
-        with contextlib.suppress(OSError):
-            sock.shutdown(socket.SHUT_WR)
-        while True:
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-
-
-def _connect_and_send_tcp(
-    instance: BridgeInstance,
-    encoded: bytes,
-    chunks: list[bytes],
-    timeout: float | None,
-) -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        if timeout is not None:
-            sock.settimeout(timeout)
-        sock.connect((instance.host, instance.port))
+        sock.connect(connect_addr)
         sock.sendall(encoded)
         with contextlib.suppress(OSError):
             sock.shutdown(socket.SHUT_WR)
@@ -195,10 +183,7 @@ def _send_request_to_instance(
     last_error: OSError | None = None
     for attempt in range(connect_retries):
         try:
-            if IS_WINDOWS and instance.host is not None and instance.port is not None:
-                _connect_and_send_tcp(instance, encoded, chunks, timeout)
-            else:
-                _connect_and_send_unix(instance, encoded, chunks, timeout)
+            _connect_and_send(instance, encoded, chunks, timeout)
             break
         except OSError as exc:
             last_error = exc
@@ -207,14 +192,18 @@ def _send_request_to_instance(
             time.sleep(0.05 * (attempt + 1))
 
     if last_error is not None and not chunks:
+        if _is_tcp_instance(instance):
+            address = f"{instance.host}:{instance.port}"
+        else:
+            address = str(instance.socket_path)
         if isinstance(last_error, TimeoutError):
             timeout_suffix = f" after {timeout:.1f}s" if timeout is not None else ""
             raise BridgeError(
-                f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.socket_path}"
+                f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {address}"
                 f"{timeout_suffix}"
             ) from last_error
         raise BridgeError(
-            f"Failed to contact Binary Ninja bridge pid {instance.pid} at {instance.socket_path}: {last_error}"
+            f"Failed to contact Binary Ninja bridge pid {instance.pid} at {address}: {last_error}"
         ) from last_error
 
     if not chunks:
