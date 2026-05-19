@@ -22,7 +22,9 @@ import binaryninja as bn
 from binaryninja.mainthread import execute_on_main_thread_and_wait, is_main_thread
 from binaryninja.plugin import PluginCommand
 
-from .paths import PLUGIN_NAME, bridge_registry_path, bridge_socket_path
+from .paths import PLUGIN_NAME, IS_WINDOWS, bridge_registry_path, bridge_socket_path
+if IS_WINDOWS:
+    from .paths import bridge_port_file, bridge_listen_address, BRIDGE_HOST
 from .version import VERSION, build_id_for_file
 
 try:
@@ -98,6 +100,8 @@ READ_LOCKED_OPS = {
     "decompile",
     "il",
     "disasm",
+    "hexdump",
+    "list_exports",
     "xrefs",
     "field_xrefs",
     "types",
@@ -113,6 +117,7 @@ READ_LOCKED_OPS = {
     "workflow_machine_dump",
     "workflow_machine_overrides",
     "workflow_machine_breakpoint_list",
+    "uidf_list",
 }
 
 
@@ -141,6 +146,10 @@ WRITE_LOCKED_OPS = {
     "workflow_machine_resume",
     "workflow_machine_breakpoint_set",
     "workflow_machine_breakpoint_clear",
+    "make_function_at",
+    "remove_function",
+    "uidf_set",
+    "uidf_clear",
 }
 
 
@@ -173,6 +182,67 @@ def _parse_address(value: Any) -> int:
     if text.lower().startswith("0x"):
         return int(text, 16)
     return int(text, 10)
+
+
+def _archandaddr_address(aa) -> int:
+    s = str(aa)
+    at_pos = s.rfind("@")
+    if at_pos == -1:
+        return 0
+    addr_part = s[at_pos + 1:].strip().rstrip(">")
+    return _parse_address(addr_part)
+
+
+def format_hexdump(address: int, data: bytes) -> str:
+    lines = []
+    for offset in range(0, len(data), 16):
+        chunk = data[offset:offset + 16]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"{address + offset:08x}  {hex_part:<48s}  |{ascii_part}|")
+    return "\n".join(lines)
+
+
+_UIDF_REQUIRES_VALUE = frozenset({"constant", "in-set", "unsigned-range", "signed-range"})
+
+
+def _make_possible_value_set(value_type: str, value_str: str | None):
+    if value_type in _UIDF_REQUIRES_VALUE and value_str is None:
+        raise ValueError(f"UIDF type '{value_type}' requires --value")
+
+    if value_type == "constant":
+        return bn.PossibleValueSet.constant(int(value_str, 0))
+    if value_type == "in-set":
+        parts = [int(x.strip(), 0) for x in value_str.split(",") if x.strip()]
+        return bn.PossibleValueSet.in_set_of_values(parts)
+    if value_type in ("unsigned-range", "signed-range"):
+        parts = value_str.split(":")
+        items = [int(x, 0) for x in parts]
+        if len(items) == 2:
+            items.insert(1, 1)  # start, step=1, end
+        start, step, end = items
+        if value_type == "unsigned-range":
+            return bn.PossibleValueSet.unsigned_range_value([bn.ValueRange(start, end, step)])
+        return bn.PossibleValueSet.signed_range_value([bn.ValueRange(start, end, step)])
+    if value_type == "entry":
+        return bn.PossibleValueSet.entry_value()
+    if value_type == "undetermined":
+        return bn.PossibleValueSet.undetermined()
+    raise ValueError(f"Unknown UIDF value type: {value_type}")
+
+
+def _unified_diff(a: str, b: str, *, fromfile: str = "before", tofile: str = "after") -> str:
+    if not a and not b:
+        return ""
+    return "\n".join(
+        difflib.unified_diff(
+            a.splitlines(),
+            b.splitlines(),
+            fromfile=fromfile,
+            tofile=tofile,
+            lineterm="",
+        )
+    )
 
 
 def _artifact_summary(value: Any) -> dict[str, Any]:
@@ -467,14 +537,33 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         self._write_response(encoded, op=op, request_id=request_id)
 
 
-class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
-    allow_reuse_address = True
-    request_queue_size = 64
+if IS_WINDOWS:
 
-    def __init__(self, socket_path: str, handler, bridge):
-        self.bridge = bridge
-        super().__init__(socket_path, handler)
+    class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+        request_queue_size = 64
+
+        def __init__(self, server_address, handler, bridge):
+            self.bridge = bridge
+            super().__init__(server_address, handler)
+
+    _BridgeServer = ThreadedTCPServer
+    _BridgeServerAddress = bridge_listen_address
+
+else:
+
+    class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+        allow_reuse_address = True
+        request_queue_size = 64
+
+        def __init__(self, socket_path: str, handler, bridge):
+            self.bridge = bridge
+            super().__init__(socket_path, handler)
+
+    _BridgeServer = ThreadedUnixServer
+    _BridgeServerAddress = lambda: (bridge_socket_path(),)
 
 
 class BinaryNinjaBridge:
@@ -482,20 +571,45 @@ class BinaryNinjaBridge:
         self.targets = TargetManager()
         self.socket_path = bridge_socket_path()
         self.registry_path = bridge_registry_path()
-        self._server: ThreadedUnixServer | None = None
+        if IS_WINDOWS:
+            self._port_file = bridge_port_file()
+            self._port: int | None = None
+        self._server: _BridgeServer | None = None
         self._thread: threading.Thread | None = None
         self._target_lock = _ReadWriteLock()
 
     def start(self):  # pragma: no cover - requires GUI runtime
+        if IS_WINDOWS:
+            self._start_tcp()
+        else:
+            self._start_unix()
+        self._write_registry()
+        bn.log_info(
+            f"BN Agent Bridge listening on {self._listen_desc()}"
+        )
+
+    def _start_unix(self):
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         if self.socket_path.exists():
             self.socket_path.unlink()
-
-        self._server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
+        self._server = _BridgeServer(str(self.socket_path), BridgeHandler, self)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
-        self._write_registry()
-        bn.log_info(f"BN Agent Bridge listening on {self.socket_path}")
+
+    def _start_tcp(self):
+        self._server = _BridgeServer(
+            _BridgeServerAddress(), BridgeHandler, self
+        )
+        self._port = self._server.server_address[1]
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        self._port_file.write_text(str(self._port), encoding="utf-8")
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def _listen_desc(self) -> str:
+        if IS_WINDOWS and self._port is not None:
+            return f"{BRIDGE_HOST}:{self._port}"
+        return str(self.socket_path)
 
     def stop(self):  # pragma: no cover - requires GUI runtime
         if self._server is not None:
@@ -503,9 +617,14 @@ class BinaryNinjaBridge:
                 self._server.shutdown()
             with contextlib.suppress(Exception):
                 self._server.server_close()
-        if self.socket_path.exists():
-            with contextlib.suppress(OSError):
-                self.socket_path.unlink()
+        if IS_WINDOWS:
+            if self._port_file.exists():
+                with contextlib.suppress(OSError):
+                    self._port_file.unlink()
+        else:
+            if self.socket_path.exists():
+                with contextlib.suppress(OSError):
+                    self.socket_path.unlink()
         if self.registry_path.exists():
             with contextlib.suppress(OSError):
                 self.registry_path.unlink()
@@ -519,6 +638,9 @@ class BinaryNinjaBridge:
             "plugin_build_id": PLUGIN_BUILD_ID,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
+        if IS_WINDOWS and self._port is not None:
+            payload["host"] = BRIDGE_HOST
+            payload["port"] = self._port
         self.registry_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def dispatch(self, payload: dict[str, Any]) -> dict[str, Any]:  # pragma: no cover - GUI runtime
@@ -570,6 +692,35 @@ class BinaryNinjaBridge:
             )
         if op == "function_info":
             return self._function_info(target, params["identifier"])
+        if op == "make_function_at":
+            return self._make_function_at(target, params["identifier"])
+        if op == "remove_function":
+            return self._remove_function(target, params["identifier"])
+        if op == "hexdump":
+            return self._hexdump(target, params["address"], int(params.get("length", 256)))
+        if op == "list_exports":
+            return self._list_exports(target)
+        if op == "uidf_set":
+            return self._uidf_set(
+                target,
+                params["function"],
+                params["variable"],
+                params["def_address"],
+                params["type"],
+                params.get("value"),
+                preview=bool(params.get("preview")),
+            )
+        if op == "uidf_list":
+            return self._uidf_list(target, params["function"])
+        if op == "uidf_clear":
+            return self._uidf_clear(
+                target,
+                params["function"],
+                params.get("variable"),
+                params.get("def_address"),
+                all_=bool(params.get("all")),
+                preview=bool(params.get("preview")),
+            )
         if op == "get_prototype":
             return self._get_prototype(target, params["identifier"])
         if op == "list_locals":
@@ -1958,6 +2109,234 @@ class BinaryNinjaBridge:
             "locals": locals_only,
         }
 
+    def _make_function_at(self, selector: str | None, identifier):
+        bv = self._resolve_view(selector)
+        try:
+            address = _parse_address(identifier)
+        except (ValueError, TypeError):
+            raise RuntimeError(f"Address required to create a function, got: {identifier}")
+        func = bv.create_user_function(address)
+        if func is None:
+            raise RuntimeError(f"Failed to create function at {hex(address)} (may already exist)")
+        metadata = self._function_metadata(func)
+        return {
+            "function": {
+                "name": func.name,
+                "address": hex(func.start),
+            },
+            **metadata,
+        }
+
+    def _remove_function(self, selector: str | None, identifier):
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, identifier)
+        name = func.name
+        address = func.start
+        if hasattr(bv, "remove_function"):
+            bv.remove_function(func)
+        else:
+            bv.remove_user_function(func)
+        return {
+            "removed": True,
+            "function": {"name": name, "address": hex(address)},
+        }
+
+    def _uidf_set(
+        self,
+        selector: str | None,
+        function_id: str,
+        var_name: str,
+        def_address: str,
+        value_type: str,
+        value_str: str | None,
+        *,
+        preview: bool = False,
+    ):
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, function_id)
+        var = self._find_variable_by_name(func, var_name)
+        addr = _parse_address(def_address)
+        pv = _make_possible_value_set(value_type, value_str)
+
+        if preview:
+            before = self._decompile_text(bv, func)
+            func.set_user_var_value(var, addr, pv)
+            bv.update_analysis_and_wait()
+            after = self._decompile_text(bv, func)
+            func.clear_user_var_value(var, addr)
+            return {
+                "preview": True,
+                "set": True,
+                "function": func.name,
+                "variable": var_name,
+                "definition_site": hex(addr),
+                "value": repr(pv),
+                "before": before,
+                "after": after,
+                "diff": _unified_diff(before, after),
+            }
+
+        func.set_user_var_value(var, addr, pv)
+        bv.update_analysis_and_wait()
+        return {
+            "preview": False,
+            "set": True,
+            "function": func.name,
+            "variable": var_name,
+            "definition_site": hex(addr),
+            "value": repr(pv),
+        }
+
+    def _uidf_list(self, selector: str | None, function_id: str):
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, function_id)
+        values = func.get_all_user_var_values()
+        items = []
+        for var, site_values in values.items():
+            var_name = getattr(var, "name", str(var))
+            for aa, pv in site_values.items():
+                addr_str = hex(_archandaddr_address(aa))
+                items.append({
+                    "variable": var_name,
+                    "definition_site": addr_str,
+                    "value": repr(pv),
+                })
+        items.sort(key=lambda item: (item["variable"], item["definition_site"]))
+        return items
+
+    def _uidf_clear(
+        self,
+        selector: str | None,
+        function_id: str,
+        var_name: str | None,
+        def_address: str | None,
+        *,
+        all_: bool = False,
+        preview: bool = False,
+    ):
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, function_id)
+
+        if all_:
+            return self._uidf_clear_all(bv, func, preview)
+
+        var = self._find_variable_by_name(func, var_name)
+        addr = _parse_address(def_address)
+        return self._uidf_clear_one(bv, func, var, var_name, addr, preview)
+
+    def _uidf_clear_all(self, bv, func, preview: bool):
+        if preview:
+            before = self._decompile_text(bv, func)
+            snapshot = func.get_all_user_var_values()
+            func.clear_all_user_var_values()
+            bv.update_analysis_and_wait()
+            after = self._decompile_text(bv, func)
+            self._restore_uidf_values(func, snapshot)
+            bv.update_analysis_and_wait()
+            return {
+                "preview": True,
+                "cleared_all": True,
+                "function": func.name,
+                "count": sum(len(sv) for sv in snapshot.values()),
+                "before": before,
+                "after": after,
+                "diff": _unified_diff(before, after),
+            }
+
+        count = sum(len(sv) for sv in func.get_all_user_var_values().values())
+        func.clear_all_user_var_values()
+        bv.update_analysis_and_wait()
+        return {
+            "preview": False,
+            "cleared_all": True,
+            "function": func.name,
+            "count": count,
+        }
+
+    def _uidf_clear_one(self, bv, func, var, var_name: str, addr: int, preview: bool):
+        if preview:
+            before = self._decompile_text(bv, func)
+            snapshot = func.get_all_user_var_values()
+            func.clear_user_var_value(var, addr)
+            bv.update_analysis_and_wait()
+            after = self._decompile_text(bv, func)
+            self._restore_uidf_values(func, snapshot)
+            bv.update_analysis_and_wait()
+            return {
+                "preview": True,
+                "cleared": True,
+                "function": func.name,
+                "variable": var_name,
+                "definition_site": hex(addr),
+                "before": before,
+                "after": after,
+                "diff": _unified_diff(before, after),
+            }
+
+        func.clear_user_var_value(var, addr)
+        bv.update_analysis_and_wait()
+        return {
+            "preview": False,
+            "cleared": True,
+            "function": func.name,
+            "variable": var_name,
+            "definition_site": hex(addr),
+        }
+
+    @staticmethod
+    def _find_variable_by_name(func, var_name: str):
+        for v in func.vars:
+            if v.name == var_name:
+                return v
+        raise RuntimeError(
+            f"Variable '{var_name}' not found in function '{func.name}'"
+        )
+
+    @staticmethod
+    def _decompile_text(bv, func) -> str:
+        try:
+            return str(func.hlil)
+        except (AttributeError, ValueError, RuntimeError):
+            return ""
+
+    @staticmethod
+    def _restore_uidf_values(func, snapshot) -> None:
+        for var, site_values in snapshot.items():
+            for aa, pv in site_values.items():
+                addr = _archandaddr_address(aa)
+                func.set_user_var_value(var, addr, pv)
+
+    def _hexdump(self, selector: str | None, address: str, length: int):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        data = bv.read(addr, length)
+        return {
+            "address": hex(addr),
+            "length": len(data),
+            "bytes": data.hex(),
+            "text": format_hexdump(addr, data),
+        }
+
+    def _list_exports(self, selector: str | None):
+        bv = self._resolve_view(selector)
+        items = []
+        for sym in list(bv.get_symbols()):
+            if sym.type not in (bn.SymbolType.FunctionSymbol, bn.SymbolType.DataSymbol):
+                continue
+            if sym.binding not in (bn.SymbolBinding.GlobalBinding, bn.SymbolBinding.WeakBinding):
+                continue
+            addr = sym.address
+            items.append({
+                "name": sym.name,
+                "address": hex(addr),
+                "type": "function" if sym.type == bn.SymbolType.FunctionSymbol else "data",
+                "binding": "global" if sym.binding == bn.SymbolBinding.GlobalBinding else "weak",
+                "namespace": str(getattr(sym, "namespace", "") or ""),
+                "_sort": (0 if sym.type == bn.SymbolType.FunctionSymbol else 1, sym.name, addr),
+            })
+        items.sort(key=lambda item: item.pop("_sort"))
+        return items
+
     def _get_prototype(self, selector: str | None, identifier):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
@@ -2406,14 +2785,10 @@ class BinaryNinjaBridge:
         for type_name in sorted(set(before) | set(after)):
             old = before.get(type_name, {"decl": "", "layout": ""})
             new = after.get(type_name, {"decl": "", "layout": ""})
-            layout_diff = "\n".join(
-                difflib.unified_diff(
-                    old["layout"].splitlines(),
-                    new["layout"].splitlines(),
-                    fromfile=f"before:{type_name}",
-                    tofile=f"after:{type_name}",
-                    lineterm="",
-                )
+            layout_diff = _unified_diff(
+                old["layout"], new["layout"],
+                fromfile=f"before:{type_name}",
+                tofile=f"after:{type_name}",
             )
             changed = old["decl"] != new["decl"] or old["layout"] != new["layout"]
             entry = {
@@ -2495,14 +2870,10 @@ class BinaryNinjaBridge:
             new = after.get(address, {"text": ""})
             text_changed = old.get("text", "") != new.get("text", "")
             name_changed = old.get("name") != new.get("name")
-            diff = "\n".join(
-                difflib.unified_diff(
-                    old["text"].splitlines(),
-                    new["text"].splitlines(),
-                    fromfile=f"before:{old.get('name', hex(address))}",
-                    tofile=f"after:{new.get('name', hex(address))}",
-                    lineterm="",
-                )
+            diff = _unified_diff(
+                old["text"], new["text"],
+                fromfile=f"before:{old.get('name', hex(address))}",
+                tofile=f"after:{new.get('name', hex(address))}",
             )
             if not diff and name_changed:
                 diff = "\n".join(

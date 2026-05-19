@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import api_docs
+from . import docs
 from .output import write_output_result
 from .paths import (
     SKILL_CLIENTS,
@@ -628,6 +629,33 @@ def _render_name_address_list_text(value: Any) -> str:
         raw_name = item.get("raw_name")
         if raw_name and raw_name != name:
             line += f" (raw: {raw_name})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _render_exports_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        address = item.get("address", "<unknown>")
+        name = item.get("name", "<unknown>")
+        item_type = item.get("type", "")
+        binding = item.get("binding", "")
+        line = f"{address}  {name}"
+        tags = []
+        if item_type:
+            tags.append(item_type)
+        if binding:
+            tags.append(binding)
+        if tags:
+            line += f"  [{', '.join(tags)}]"
         lines.append(line)
     return "\n".join(lines)
 
@@ -1394,6 +1422,146 @@ def _function_info(args: argparse.Namespace) -> int:
     )
 
 
+def _function_create(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "make_function_at",
+        {"identifier": args.identifier},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_function_info_text,
+        stem="function-create",
+    )
+
+
+def _function_delete(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "remove_function",
+        {"identifier": args.identifier},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="function-delete",
+    )
+
+
+def _hexdump(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "hexdump",
+        {"address": args.address, "length": min(args.length, 65536)},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_text_field("text"),
+        stem="hexdump",
+    )
+
+
+def _exports(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "list_exports",
+        {},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_exports_text,
+        stem="exports",
+    )
+
+
+def _render_uidf_list_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "no UIDF constraints"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        lines.append(
+            f"{item.get('variable', '<unknown>')} @ {item.get('definition_site', '<unknown>')}  "
+            f"→ {item.get('value', '<unknown>')}"
+        )
+    return "\n".join(lines)
+
+
+def _render_uidf_mutation_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    preview = " [preview]" if value.get("preview") else ""
+    if value.get("set"):
+        lines = [
+            f"set{preview}: {value.get('variable', '?')} @ {value.get('definition_site', '?')} "
+            f"= {value.get('value', '?')}",
+            f"function: {value.get('function', '?')}",
+        ]
+    elif value.get("cleared_all"):
+        lines = [
+            f"clear-all{preview}: {value.get('count', 0)} constraint(s)",
+            f"function: {value.get('function', '?')}",
+        ]
+    else:
+        lines = [
+            f"clear{preview}: {value.get('variable', '?')} @ {value.get('definition_site', '?')}",
+            f"function: {value.get('function', '?')}",
+        ]
+    if value.get("diff"):
+        lines.append(f"\ndiff:\n{value['diff']}")
+    return "\n".join(lines)
+
+
+def _uidf_set(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "uidf_set",
+        {
+            "function": args.function,
+            "variable": args.variable,
+            "def_address": args.def_address,
+            "type": args.type,
+            "value": args.value,
+            "preview": bool(args.preview),
+        },
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_uidf_mutation_text,
+        stem="uidf-set",
+        result_exit_code=_mutation_exit_code,
+    )
+
+
+def _uidf_list(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "uidf_list",
+        {"function": args.function},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_uidf_list_text,
+        stem="uidf-list",
+    )
+
+
+def _uidf_clear(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "uidf_clear",
+        {
+            "function": args.function,
+            "variable": args.variable,
+            "def_address": args.def_address,
+            "all": bool(args.all),
+            "preview": bool(args.preview),
+        },
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_uidf_mutation_text,
+        stem="uidf-clear",
+        result_exit_code=_mutation_exit_code,
+    )
+
+
 def _decompile(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1936,6 +2104,39 @@ def _api_docs_refresh(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── docs command ─────────────────────────────────────────────────────────
+
+def _docs_resolve_dir(args: argparse.Namespace) -> Path:
+    return docs.find_docs_dir(getattr(args, "docs_dir", None))
+
+
+def _docs_search(args: argparse.Namespace) -> int:
+    docs_dir = _docs_resolve_dir(args)
+    entries = docs.build_index(docs_dir)
+    results = docs.search(entries, args.pattern)
+    result: Any = docs.format_search_results(results)
+    _render_result(result, fmt=args.format, out_path=args.out, stem="docs-search")
+    return 0
+
+
+def _docs_show(args: argparse.Namespace) -> int:
+    docs_dir = _docs_resolve_dir(args)
+    result: Any = docs.show_page(docs_dir, args.name)
+    if result is None:
+        print(f"No page matching '{args.name}'", file=sys.stderr)
+        return 2
+    _render_result(result, fmt=args.format, out_path=args.out, stem="docs-show")
+    return 0
+
+
+def _docs_list(args: argparse.Namespace) -> int:
+    docs_dir = _docs_resolve_dir(args)
+    entries = docs.build_index(docs_dir)
+    result = docs.list_pages(entries, getattr(args, "filter", ""))
+    _render_result(result, fmt=args.format, out_path=args.out, stem="docs-list")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = BnArgumentParser(prog="bn", description="Agent-friendly Binary Ninja CLI")
     parser.set_defaults(handler=None)
@@ -2179,6 +2380,16 @@ def build_parser() -> argparse.ArgumentParser:
     _target_option(function_info, required=False)
     function_info.add_argument("identifier")
     function_info.set_defaults(handler=_function_info)
+    function_create = function_sub.add_parser("create", help="Create a function at an address")
+    _common_io_options(function_create, default_format="json")
+    _target_option(function_create, required=False)
+    function_create.add_argument("identifier", help="Address to create the function at (e.g. 0x401000)")
+    function_create.set_defaults(handler=_function_create)
+    function_delete = function_sub.add_parser("delete", help="Remove a function definition")
+    _common_io_options(function_delete, default_format="json")
+    _target_option(function_delete, required=False)
+    function_delete.add_argument("identifier")
+    function_delete.set_defaults(handler=_function_delete)
 
     decompile = subparsers.add_parser("decompile", help="Render HLIL-style decompile text for a function")
     _common_io_options(decompile)
@@ -2199,6 +2410,13 @@ def build_parser() -> argparse.ArgumentParser:
     _target_option(disasm, required=False)
     disasm.add_argument("identifier")
     disasm.set_defaults(handler=_disasm)
+
+    hexdump = subparsers.add_parser("hexdump", help="Hexdump data at an address")
+    _common_io_options(hexdump, default_format="json")
+    _target_option(hexdump, required=False)
+    hexdump.add_argument("address")
+    hexdump.add_argument("--length", type=int, default=256, help="Number of bytes to dump (default: 256)")
+    hexdump.set_defaults(handler=_hexdump)
 
     xrefs = subparsers.add_parser("xrefs", help="List xrefs to an address or function, or `field <Struct.field>`")
     _common_io_options(xrefs)
@@ -2259,6 +2477,44 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(imports)
     _target_option(imports, required=False)
     imports.set_defaults(handler=_imports)
+
+    exports = subparsers.add_parser("exports", help="List exports")
+    _common_io_options(exports)
+    _target_option(exports, required=False)
+    exports.set_defaults(handler=_exports)
+
+    uidf = subparsers.add_parser("uidf", help="User-Informed Data Flow constraints")
+    uidf_sub = uidf.add_subparsers(dest="uidf_command")
+    uidf_set = uidf_sub.add_parser("set", help="Set a UIDF constraint on a variable")
+    _common_io_options(uidf_set, default_format="json")
+    _target_option(uidf_set, required=False)
+    uidf_set.add_argument("--preview", action="store_true")
+    uidf_set.add_argument("function")
+    uidf_set.add_argument("variable", help="Variable name (e.g. rax_2)")
+    uidf_set.add_argument("def_address", help="Definition site address (e.g. 0x40108d)")
+    uidf_set.add_argument(
+        "--type", required=True,
+        choices=("constant", "in-set", "unsigned-range", "signed-range", "entry", "undetermined"),
+        help="PossibleValueSet type"
+    )
+    uidf_set.add_argument("--value", help="Value string (not needed for entry/undetermined)")
+    uidf_set.set_defaults(handler=_uidf_set)
+
+    uidf_list = uidf_sub.add_parser("list", help="List all UIDF constraints for a function")
+    _common_io_options(uidf_list)
+    _target_option(uidf_list, required=False)
+    uidf_list.add_argument("function")
+    uidf_list.set_defaults(handler=_uidf_list)
+
+    uidf_clear = uidf_sub.add_parser("clear", help="Clear UIDF constraints")
+    _common_io_options(uidf_clear, default_format="json")
+    _target_option(uidf_clear, required=False)
+    uidf_clear.add_argument("--preview", action="store_true")
+    uidf_clear.add_argument("function")
+    uidf_clear.add_argument("--variable", help="Variable name")
+    uidf_clear.add_argument("--def-address", dest="def_address", help="Definition site address")
+    uidf_clear.add_argument("--all", action="store_true", help="Clear all UIDF constraints")
+    uidf_clear.set_defaults(handler=_uidf_clear)
 
     bundle = subparsers.add_parser("bundle", help="Export reusable bundles")
     bundle_sub = bundle.add_subparsers(dest="bundle_command")
@@ -2469,6 +2725,35 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(api_docs_refresh, default_format="json")
     _docs_dir_arg(api_docs_refresh)
     api_docs_refresh.set_defaults(handler=_api_docs_refresh)
+
+    # docs command — searches the guide/tutorial HTML docs
+    docs_parser = subparsers.add_parser(
+        "docs",
+        help="Search Binary Ninja guide/docs HTML pages (no target required)",
+    )
+    docs_sub = docs_parser.add_subparsers(dest="docs_command")
+    _docs_dir_arg_fn = lambda p: p.add_argument(
+        "--docs-dir",
+        help="Path to the docs directory. Defaults to BN_DOCS_DIR or auto-detected.",
+    )
+
+    docs_search = docs_sub.add_parser("search", help="Full-text search across all docs pages")
+    _common_io_options(docs_search)
+    _docs_dir_arg_fn(docs_search)
+    docs_search.add_argument("pattern", help="Search keyword or regex")
+    docs_search.set_defaults(handler=_docs_search)
+
+    docs_show = docs_sub.add_parser("show", help="Show the full text of a docs page")
+    _common_io_options(docs_show)
+    _docs_dir_arg_fn(docs_show)
+    docs_show.add_argument("name", help="Page name (e.g. bnil-modifying, cookbook)")
+    docs_show.set_defaults(handler=_docs_show)
+
+    docs_list = docs_sub.add_parser("list", help="List all docs pages")
+    _common_io_options(docs_list)
+    _docs_dir_arg_fn(docs_list)
+    docs_list.add_argument("--filter", help="Optional name/title filter", default="")
+    docs_list.set_defaults(handler=_docs_list)
 
     return parser
 

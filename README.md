@@ -146,9 +146,14 @@ bn struct show Player
 bn types declare --file /path/to/win32_min.h --preview
 bn strings --query follow
 bn imports
+bn exports
+bn hexdump 0x401000
+bn hexdump 0x401000 --length 64
 ```
 
 `bn function search` stays case-insensitive substring matching by default. Add `--regex` when you need regular expressions. `bn function list` and `bn function search` both accept `--min-address` and `--max-address` to filter by function start address.
+
+`bn exports` lists exported symbols (functions and data) with their binding (global/weak) and namespace. `bn hexdump` dumps raw bytes at an address in classic hexdump format; default length is 256 bytes, capped at 65536.
 
 `bn callsites` is the direct-call lane for exact return-address recovery. It reports both the native `call_addr` and the post-call `caller_static`, where `caller_static = call_addr + instruction_length`. Scope it with `--within <function>` or `--within-file <path>`; the file format is one function identifier per non-empty line, with `#` comments ignored.
 
@@ -160,6 +165,31 @@ Each callsite row also includes:
 - `pre_branch_condition`: the nearest enclosing pre-call HLIL condition when it can be recovered confidently, otherwise `null`
 
 `hlil_statement` is intentionally local-or-null. If the best available HLIL mapping expands to a broad whole-function or multi-statement blob, `bn callsites` suppresses it instead of returning noisy context.
+
+## Documentation Lookup
+
+`bn api-docs` and `bn docs` search Binary Ninja's local documentation (no target or open binary required).
+
+`bn api-docs` queries the Sphinx HTML API reference:
+
+```bash
+bn api-docs search read --kind method
+bn api-docs search --regex '^bn.*\.log_'
+bn api-docs show binaryninja.BinaryView.read
+bn api-docs list --module binaryninja.highlevelil --kind class
+bn api-docs refresh
+```
+
+`bn docs` searches the guide and tutorial HTML pages:
+
+```bash
+bn docs search "control flow"
+bn docs show bnil-modifying
+bn docs list
+bn docs list --filter cookbook
+```
+
+Override with `--docs-dir` or the `BN_API_DOCS_DIR` / `BN_DOCS_DIR` environment variables.
 
 ## Bundles And Python
 
@@ -225,6 +255,8 @@ bn local rename sub_401000 0x401000:local:StackVariableSourceType:-20:2:12345 sp
 bn local retype sub_401000 0x401000:local:StackVariableSourceType:-20:2:12345 float --preview
 bn types declare "typedef struct Player { int hp; } Player;" --preview
 bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
+bn function create 0x401000
+bn function delete sub_401000
 ```
 
 Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
@@ -257,7 +289,24 @@ When verification fails, JSON output also includes `requested` and `observed` st
 
 If a declaration only parses functions or extern variables and introduces no named types to persist, `types declare` returns a verified no-op instead of failing with `No named types found in declaration`.
 
+`bn function create` creates a user function at a given address; returns an error if a function already exists there. `bn function delete` removes a function definition — works on both user-created and auto-analyzed functions.
+
 `bn local list` and `bn function info` return stable `local_id` values for parameters and locals. Prefer those IDs for `bn local rename`, `bn local retype`, and batch manifests; legacy name-based targeting still works for compatibility.
+
+## User-Informed Data Flow (UIDF)
+
+`bn uidf` sets, lists, and clears user-informed variable values to guide Binary Ninja's dataflow engine:
+
+```bash
+bn uidf list JNI_OnLoad
+bn uidf set JNI_OnLoad var_58 0x3f4b4 --type constant --value 0 --preview
+bn uidf set JNI_OnLoad var_58 0x3f4b4 --type constant --value 0
+bn uidf set JNI_OnLoad rax_2 0x40108d --type in-set --value "1,2,3"
+bn uidf clear JNI_OnLoad --variable var_58 --def-address 0x3f4b4 --preview
+bn uidf clear JNI_OnLoad --all
+```
+
+Supported value types: `constant`, `in-set`, `unsigned-range`, `signed-range`, `entry`, `undetermined`. Use `--preview` to see the decompile diff before applying.
 
 ## Batch Manifests
 

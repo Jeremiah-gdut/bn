@@ -55,9 +55,16 @@ bn types show Player
 bn struct show Player
 bn strings --query follow
 bn imports
+bn exports
+bn hexdump 0x401000
+bn hexdump 0x401000 --length 64
 ```
 
 `bn function search` is case-insensitive substring matching by default. Add `--regex` when you need regular expressions. `bn function list` and `bn function search` both accept `--min-address` and `--max-address`.
+
+`bn exports` lists exported symbols (function/data, global/weak binding). Each entry shows address, name, type, and binding.
+
+`bn hexdump` dumps raw bytes at an address in classic hexdump format with offset, hex bytes, and ASCII columns. Default length is 256 bytes.
 
 ## API Documentation Lookup
 
@@ -72,6 +79,17 @@ bn api-docs refresh                              # rebuild the on-disk index aft
 ```
 
 `show` requires a unique match. If you pass a bare name (e.g. `read`) and several symbols share it, the command prints the qualified candidates and exits non-zero — pass the qualified name to disambiguate.
+
+## Guide Documentation Lookup
+
+`bn docs` searches the Binary Ninja guide and tutorial HTML pages (no target required):
+
+```bash
+bn docs search "control flow"      # full-text search across all pages
+bn docs show bnil-modifying         # show full text of a specific page
+bn docs list                        # list all indexed pages
+bn docs list --filter cookbook      # filter by name/title
+```
 
 ## Workflow Inspection
 
@@ -235,6 +253,8 @@ bn symbol rename sub_401000 player_update --preview
 bn proto get sub_401000
 bn local list sub_401000
 bn proto set sub_401000 "int __cdecl player_update(Player* self)" --preview
+bn function create 0x401000
+bn function delete sub_401000
 ```
 
 Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
@@ -248,6 +268,10 @@ If a struct edit is already identical, preview may report `changed: false` with 
 `bn types declare` uses Binary Ninja's source parser when available. With `--file`, it forwards the real source path so relative includes work like GUI header import.
 
 If a declaration only introduces functions or extern variables and no named types, `types declare` now reports a no-op instead of failing with `No named types found in declaration`.
+
+`bn function create` creates a user function at a given address. Returns the function info (name, address, prototype) on success. Errors if a function already exists at the address.
+
+`bn function delete` removes a function definition, accepting the same identifier shapes as `bn function info`. Works on both user-created and auto-analyzed functions.
 
 Non-preview writes are live-verified by default. If the requested state does not read back from Binary Ninja, the command exits nonzero and the whole mutation or batch is reverted.
 
@@ -273,3 +297,18 @@ If you need to force BN to recalculate presentation after a type change, run:
 ```bash
 bn refresh
 ```
+
+## User-Informed Data Flow (UIDF)
+
+`bn uidf` sets, lists, and clears user-informed variable values that propagate through Binary Ninja's dataflow engine, enabling branch elimination and jump-table recovery without emulation or debugging.
+
+```bash
+bn uidf list sub_main
+bn uidf set sub_main rax_2 0x40108d --type constant --value 0 --preview
+bn uidf set sub_main rax_2 0x40108d --type constant --value 0
+bn uidf set sub_main eax 0x8048553 --type unsigned-range --value "0:0x13:1"
+bn uidf clear sub_main --variable rax_2 --def-address 0x40108d --preview
+bn uidf clear sub_main --all
+```
+
+Supported `--type` values: `constant` (integer), `in-set` (comma-separated), `unsigned-range` (`start:step:end`), `signed-range`, `entry`, `undetermined`. The variable name and definition site come from `bn il <func> --view mlil`.
