@@ -1500,9 +1500,26 @@ class BinaryNinjaBridge:
             if ssa and hasattr(il, "ssa_form") and il.ssa_form is not None:
                 il = il.ssa_form
             lines = []
+            func_comments = getattr(func, "comments", None) or {}
+            pending_comments = sorted(func_comments.keys())
+            cmt_idx = 0
             for ins in il.instructions:
-                address = getattr(ins, "address", func.start)
-                lines.append(f"{int(address):08x}        {ins}")
+                ins_addr = int(getattr(ins, "address", func.start))
+                while cmt_idx < len(pending_comments) and pending_comments[cmt_idx] < ins_addr:
+                    cmt_addr = pending_comments[cmt_idx]
+                    for comment_line in func_comments[cmt_addr].splitlines():
+                        stripped = comment_line.strip()
+                        if stripped:
+                            lines.append(f"{cmt_addr:08x}        // {stripped}")
+                    cmt_idx += 1
+                lines.append(f"{ins_addr:08x}        {ins}")
+            while cmt_idx < len(pending_comments):
+                cmt_addr = pending_comments[cmt_idx]
+                for comment_line in func_comments[cmt_addr].splitlines():
+                    stripped = comment_line.strip()
+                    if stripped:
+                        lines.append(f"{cmt_addr:08x}        // {stripped}")
+                cmt_idx += 1
             if lines:
                 return "\n".join(lines)
         except Exception:
@@ -1556,15 +1573,32 @@ class BinaryNinjaBridge:
 
     def _disasm_text(self, bv, func) -> str:
         lines = []
+        func_comments = getattr(func, "comments", None) or {}
+        pending_cmts = sorted(func_comments.keys()) if func_comments else []
+        cmt_idx = 0
         for block in list(func.basic_blocks):
             addr = block.start
             while addr < block.end:
+                while cmt_idx < len(pending_cmts) and pending_cmts[cmt_idx] < addr:
+                    cmt_addr = pending_cmts[cmt_idx]
+                    for comment_line in func_comments[cmt_addr].splitlines():
+                        stripped = comment_line.strip()
+                        if stripped:
+                            lines.append(f"{cmt_addr:08x}        // {stripped}")
+                    cmt_idx += 1
                 length = max(1, self._instruction_length(bv, int(addr)))
                 disasm = bv.get_disassembly(addr) or ""
                 raw = bv.read(addr, length)
                 hex_bytes = raw.hex(" ") if raw else ""
                 lines.append(f"{addr:08x}  {hex_bytes:<16} {disasm}")
                 addr += length
+        while cmt_idx < len(pending_cmts):
+            cmt_addr = pending_cmts[cmt_idx]
+            for comment_line in func_comments[cmt_addr].splitlines():
+                stripped = comment_line.strip()
+                if stripped:
+                    lines.append(f"{cmt_addr:08x}        // {stripped}")
+            cmt_idx += 1
         return "\n".join(lines)
 
     def _sort_variable_entries(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
